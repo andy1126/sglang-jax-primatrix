@@ -1646,11 +1646,12 @@ def _fused_ep_moe_kernel(
         # Make sure it is safe to overwrite output buffer (bt_id-2 uses the same buffer).
         # Note: epic overlaps this wait with bt_acc compute by delaying the store into b_output_x2_vmem.
         # Our acc path writes directly into b_output_x2_vmem during reduction, so we must wait before acc.
-        wait_store_output(bt_id=bt_id - jnp.int32(2))
+        if a2a_only:
+            wait_store_output(bt_id=bt_id - jnp.int32(2))
 
-        # Accumulate results for current bt into b_output_x2_vmem, then start async send to output_hbm.
-        acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
-        start_send_bo(bt_id=bt_id)
+            # Accumulate results for current bt into b_output_x2_vmem, then start async send to output_hbm.
+            acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
+            start_send_bo(bt_id=bt_id)
 
         # Drain the last outstanding gather sends (the loop body waits `local_e_id - 2`).
         wait_a2a_gather_send(
@@ -1668,8 +1669,9 @@ def _fused_ep_moe_kernel(
 
     lax.fori_loop(0, num_bt, run_bt, jnp.int32(0), unroll=False)
     # Drain outstanding output stores (matches epic wait_send_bo for last two bts).
-    wait_store_output(bt_id=jnp.int32(num_bt - 2))
-    wait_store_output(bt_id=jnp.int32(num_bt - 1))
+    if a2a_only:
+        wait_store_output(bt_id=jnp.int32(num_bt - 2))
+        wait_store_output(bt_id=jnp.int32(num_bt - 1))
 
     ### ------- Kernel end ------- ###
 
