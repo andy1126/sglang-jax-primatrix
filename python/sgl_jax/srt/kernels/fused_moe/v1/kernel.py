@@ -1598,28 +1598,50 @@ def _fused_ep_moe_kernel(
 
         wait_fetch_b_gating(bt_id=bt_id)
 
-        b_gating = b_gating_vmem.at[bt_sem_id][...]
-        if no_comm:
-            # Force local-only routing so the kernel can execute end-to-end without EP communication.
-            e0 = my_id * local_num_experts
-            e1 = e0 + local_num_experts
-            expert_iota = jax.lax.broadcasted_iota(jnp.int32, (padded_num_experts,), 0)
-            is_local_expert = jnp.logical_and(expert_iota >= e0, expert_iota < e1)
-            b_gating = jnp.where(is_local_expert, b_gating, jnp.array(-jnp.inf, b_gating.dtype))
-        b_gating_score = jax.nn.softmax(b_gating, axis=-1)
-        t2e_routing, expert_sizes, expert_starts = get_top_k(
-            b_gating_score,
-            top_k,
-            renormalize_topk_logits,
-            out_top_k_logits_vmem=top_k_logits_vmem,
-        )
+        # b_gating = b_gating_vmem.at[bt_sem_id][...]
+        # if no_comm:
+        #     # Force local-only routing so the kernel can execute end-to-end without EP communication.
+        #     e0 = my_id * local_num_experts
+        #     e1 = e0 + local_num_experts
+        #     expert_iota = jax.lax.broadcasted_iota(jnp.int32, (padded_num_experts,), 0)
+        #     is_local_expert = jnp.logical_and(expert_iota >= e0, expert_iota < e1)
+        #     b_gating = jnp.where(is_local_expert, b_gating, jnp.array(-jnp.inf, b_gating.dtype))
+        # b_gating_score = jax.nn.softmax(b_gating, axis=-1)
+        # t2e_routing, expert_sizes, expert_starts = get_top_k(
+        #     b_gating_score,
+        #     top_k,
+        #     renormalize_topk_logits,
+        #     out_top_k_logits_vmem=top_k_logits_vmem,
+        # )
+        # 每个专家在此 batch 中分到的 token 数
+        balanced_sz = (output_bt * top_k) // num_experts
 
-        all_reduce_metadata(
-            bt_sem_id=bt_sem_id,
-            t2e_routing=t2e_routing,
-            starts=expert_starts,
-            sizes=expert_sizes,
-        )
+        # 构造 t2e_routing: (output_bt, padded_top_k)
+        # 每个 token i 的第 k 个专家设定为 (i * top_k + k) % num_experts
+        t_iota = jax.lax.broadcasted_iota(jnp.int32, (output_bt, padded_top_k), 0)
+        k_iota = jax.lax.broadcasted_iota(jnp.int32, (output_bt, padded_top_k), 1)
+        t2e_routing = (t_iota * top_k + k_iota) % num_experts
+
+        # 构造专家大小和起始偏移
+        expert_sizes = jnp.full((1, padded_num_experts), balanced_sz, dtype=jnp.int32)
+        expert_starts = jnp.arange(padded_num_experts, dtype=jnp.int32) * balanced_sz
+        expert_starts = expert_starts[None, :]
+
+        # all_reduce_metadata(
+        #     bt_sem_id=bt_sem_id,
+        #     t2e_routing=t2e_routing,
+        #     starts=expert_starts,
+        #     sizes=expert_sizes,
+        # )
+        # 手动将构造好的均衡数据写入 SMEM
+        t2e_routing_smem[bt_sem_id][...] = t2e_routing
+        expert_sizes_smem[bt_sem_id][...] = expert_sizes
+        expert_starts_smem[bt_sem_id][...] = expert_starts
+        # 每一个设备发送给每一个专家的数量也是均衡的
+        d2e_count_smem[bt_sem_id][...] = balanced_sz // num_devices
+
+        # 初始化偏移量（Scatter 逻辑会原地修改这个 buffer）
+        expert_offsets_smem[bt_sem_id][...] = jnp.zeros_like(expert_offsets_smem[bt_sem_id])
         sync_barrier()
 
         # Start a2a scatter for first active expert.
